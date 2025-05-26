@@ -2,129 +2,142 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from xgboost import XGBRegressor
+from datetime import datetime, timedelta
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pytrends.request import TrendReq
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
+from xgboost import XGBRegressor
 
-# --- 1. CONFIG ---
-
-st.set_page_config("XGBoost Crypto Predictor", layout="wide")
-
-COIN_OPTIONS = {
+# ---- CONFIG ----
+COINS = {
     "Bitcoin": "bitcoin",
     "Ethereum": "ethereum",
     "Solana": "solana",
+    "XRP": "ripple",
     "Dogecoin": "dogecoin",
-    "Litecoin": "litecoin",
     "Cardano": "cardano",
     "Avalanche": "avalanche-2",
-    "Chainlink": "chainlink",
-    "Polygon": "polygon",
-    "XRP": "ripple",
+    "Shiba Inu": "shiba-inu",
+    "Litecoin": "litecoin",
+    "Chainlink": "chainlink"
 }
-DEFAULT_COIN = "bitcoin"
+VS_CURRENCY = "usd"
+NEWS_API_KEY = "YOUR_NEWSAPI_KEY"   # Replace with your NewsAPI key
 
-# --- 2. FETCH DATA ---
+# ---- FUNCTIONS ----
+def fetch_price_history(coin_id, days):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": VS_CURRENCY, "days": days}
+    r = requests.get(url, params=params)
+    data = r.json()
+    prices = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
+    prices["date"] = pd.to_datetime(prices["timestamp"], unit="ms").dt.date
+    prices = prices.groupby("date").last().reset_index()
+    return prices[["date", "price"]]
 
-@st.cache_data(show_spinner=False)
-def fetch_coingecko_price(coin_id, days=365):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}"
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        return None
-    prices = resp.json().get("prices", [])
-    if not prices:
-        return None
-    df = pd.DataFrame(prices, columns=["time", "close"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df = df.set_index("time").resample("D").last().ffill().reset_index()
-    return df
+def fetch_google_trends(keyword, days):
+    pytrends = TrendReq(hl='en-US', tz=360)
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days)
+    timeframe = f"{start_date} {end_date}"
+    pytrends.build_payload([keyword], timeframe=timeframe)
+    data = pytrends.interest_over_time().reset_index()
+    data["date"] = data["date"].dt.date
+    data = data.rename(columns={keyword: "trend"})
+    return data[["date", "trend"]]
 
-# --- 3. FEATURES ---
+def fetch_news_sentiment(keyword, days):
+    analyzer = SentimentIntensityAnalyzer()
+    base_url = "https://newsapi.org/v2/everything"
+    today = datetime.now()
+    from_date = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+    params = {
+        "q": keyword,
+        "from": from_date,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "apiKey": NEWS_API_KEY,
+        "pageSize": 100,
+    }
+    r = requests.get(base_url, params=params)
+    articles = r.json().get("articles", [])
+    if not articles:
+        return pd.DataFrame({"date": [], "sentiment": []})
+    df = pd.DataFrame([{
+        "date": pd.to_datetime(a["publishedAt"]).date(),
+        "title": a["title"]
+    } for a in articles])
+    df["sentiment"] = df["title"].apply(lambda x: analyzer.polarity_scores(x)["compound"])
+    sentiment_daily = df.groupby("date")["sentiment"].mean().reset_index()
+    return sentiment_daily
 
-def make_features(df, lookback=14):
-    df = df.copy()
-    df["returns"] = df["close"].pct_change()
-    df["ma"] = df["close"].rolling(lookback).mean()
+def make_features(df, lookback):
+    df["returns"] = np.log(df["price"] / df["price"].shift(1))
     df["vol"] = df["returns"].rolling(lookback).std()
-    df["momentum"] = df["close"] - df["close"].shift(lookback)
-    df = df.dropna()
+    df["ma"] = df["price"].rolling(lookback).mean()
+    df["momentum"] = df["price"] - df["ma"]
+    df = df.fillna(0)
     return df
 
-# --- 4. DASHBOARD CONTROLS ---
+# ---- APP ----
+st.title("Quantum-Ready Crypto Predictor (with Sentiment & Trends)")
+coin = st.selectbox("Choose a coin", list(COINS.keys()))
+days = st.slider("Days of data", 60, 365, 365)
+lookback = st.slider("Feature lookback window (days)", 2, 30, 7)
+forecast_horizon = st.slider("Forecast steps ahead (days)", 1, 7, 1)
 
-st.title("🚀 Crypto Next-Price Predictor (XGBoost)")
-with st.sidebar:
-    coin_name = st.selectbox("Crypto Coin", list(COIN_OPTIONS.keys()), index=0)
-    lookback = st.slider("Lookback Window (days)", min_value=5, max_value=60, value=14, step=1)
-    forecast_days = st.slider("Forecast Horizon (days ahead)", min_value=1, max_value=7, value=1, step=1)
-    days = st.slider("Days of Data to Fetch", min_value=120, max_value=1095, value=365, step=1)
-    show_pred_chart = st.checkbox("Show Prediction Chart", value=True)
+st.info("Fetching price data, news sentiment, and trends...")
 
-# --- 5. LOAD & PROCESS DATA ---
+df = fetch_price_history(COINS[coin], days)
+trend_df = fetch_google_trends(coin, days)
+sent_df = fetch_news_sentiment(coin, days)
 
-coin_id = COIN_OPTIONS[coin_name]
-df = fetch_coingecko_price(coin_id, days=days)
+# Merge features
+df = df.merge(trend_df, on="date", how="left")
+df = df.merge(sent_df, on="date", how="left")
+df = make_features(df, lookback)
+df = df.fillna(0)
 
-if df is None or len(df) < (lookback + forecast_days + 10):
-    st.warning("Not enough data to model. Choose a different coin or reduce lookback/horizon.")
-    st.stop()
+# ML modeling
+if len(df) < lookback + forecast_horizon + 1:
+    st.error("Not enough data to fit the model. Try lowering lookback/horizon.")
+else:
+    # Feature/target setup
+    features = ["price", "vol", "momentum", "trend", "sentiment"]
+    X, y = [], []
+    for i in range(len(df) - lookback - forecast_horizon):
+        X.append(df[features].iloc[i:i+lookback].values.flatten())
+        y.append(df["price"].iloc[i+lookback+forecast_horizon-1])
+    X = np.array(X)
+    y = np.array(y)
 
-df_feat = make_features(df, lookback=lookback)
-# Prepare supervised learning (X = features, y = next close)
-df_feat["target"] = df_feat["close"].shift(-forecast_days)
-df_feat = df_feat.dropna().reset_index(drop=True)
+    # Train/test split
+    if len(y) > 7:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, shuffle=False)
+    else:
+        X_train, X_test, y_train, y_test = X, X, y, y
 
-if len(df_feat) < 40:
-    st.warning("Not enough samples after feature engineering. Try smaller lookback/horizon or a different coin.")
-    st.stop()
+    model = XGBRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    st.success(f"MAE (test): {mae:.2f} {VS_CURRENCY.upper()}")
 
-FEATURES = ["close", "ma", "vol", "momentum"]
+    # Next-day prediction (rolling forward)
+    recent_feat = df[features].iloc[-lookback:].values.flatten().reshape(1, -1)
+    pred_next = model.predict(recent_feat)[0]
+    st.write(f"**Predicted price for {coin} ({forecast_horizon} day(s) ahead):** {pred_next:,.2f} {VS_CURRENCY.upper()}")
 
-X = df_feat[FEATURES].values
-y = df_feat["target"].values
+    # Plot
+    chart_df = df[["date", "price"]].copy()
+    chart_df["pred"] = np.nan
+    chart_df.loc[chart_df.index[-1], "pred"] = pred_next
+    st.line_chart(chart_df.set_index("date"))
 
-# --- 6. TRAIN/VALIDATE MODEL ---
+    with st.expander("Show full DataFrame"):
+        st.dataframe(df)
 
-split_idx = int(len(df_feat)*0.8)
-X_train, X_test = X[:split_idx], X[split_idx:]
-y_train, y_test = y[:split_idx], y[split_idx:]
+    st.caption("Features: price, vol (volatility), momentum, Google Trend, news sentiment. Models retrain on each run for latest predictions.")
 
-model = XGBRegressor(n_estimators=100, random_state=42)
-model.fit(X_train, y_train)
-
-df_feat["pred"] = model.predict(X)
-
-mae = mean_absolute_error(y_test, model.predict(X_test))
-
-# --- 7. SHOW RESULTS ---
-
-st.subheader(f"{coin_name} — MAE: ${mae:,.2f}")
-
-if show_pred_chart:
-    plot_df = df_feat[["time", "close", "pred"]].copy()
-    plot_df = plot_df.set_index("time")
-    # Make the predicted line red, actual blue
-    st.line_chart(plot_df.rename(columns={"close": "Actual Close", "pred": "Predicted Next Close"}))
-
-# --- 8. FUTURE PRICE FORECAST ---
-
-st.markdown("### Forecast Next Price(s)")
-with st.expander("Show forecast for next N days", expanded=True):
-    future_window = df_feat.iloc[-1:][FEATURES].values
-    preds = []
-    last_vals = df_feat.iloc[-1].copy()
-    for step in range(forecast_days):
-        next_pred = model.predict(future_window)[0]
-        preds.append(next_pred)
-        # Roll window forward: simulate the next close
-        last_vals["close"] = next_pred
-        last_vals["ma"] = (last_vals["ma"]*(lookback-1) + next_pred)/lookback
-        last_vals["momentum"] = next_pred - last_vals["close"]
-        # vol is not advanced for simplicity
-        future_window = last_vals[FEATURES].values.reshape(1, -1)
-    st.write(f"**Forecast for next {forecast_days} day(s):**")
-    st.write([f"${p:,.2f}" for p in preds])
-
-st.caption("100% cloud/streamlit. No files or local dependencies.")
-
+# --- END APP ---
