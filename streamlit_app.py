@@ -2,107 +2,129 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from sklearn.preprocessing import StandardScaler
-import xgboost as xgb
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
 
-# ----- UI Controls -----
-st.title("🔮 Crypto Price Forecast: XGBoost Only (Quantum Ready)")
+# --- 1. CONFIG ---
 
-forecast_days = st.slider("Forecast horizon (days ahead)", 1, 7, 1)
-lookback = st.slider("Lookback window (days)", 14, 90, 30)
-coin = st.selectbox(
-    "Crypto Pair (USD)", [
-        "bitcoin", "ethereum", "solana", "dogecoin",
-        "avalanche-2", "litecoin", "chainlink",
-        "uniswap", "pepe", "arbitrum"
-    ],
-    format_func=lambda x: x.replace("-", " ").upper()
-)
-st.caption("Powered by CoinGecko API (public rate limits apply).")
+st.set_page_config("XGBoost Crypto Predictor", layout="wide")
 
-@st.cache_data(show_spinner=True)
-def fetch_coingecko_price(coin, days=365):
-    url = (
-        f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
-        f"?vs_currency=usd&days={days}&interval=daily"
-    )
+COIN_OPTIONS = {
+    "Bitcoin": "bitcoin",
+    "Ethereum": "ethereum",
+    "Solana": "solana",
+    "Dogecoin": "dogecoin",
+    "Litecoin": "litecoin",
+    "Cardano": "cardano",
+    "Avalanche": "avalanche-2",
+    "Chainlink": "chainlink",
+    "Polygon": "polygon",
+    "XRP": "ripple",
+}
+DEFAULT_COIN = "bitcoin"
+
+# --- 2. FETCH DATA ---
+
+@st.cache_data(show_spinner=False)
+def fetch_coingecko_price(coin_id, days=365):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}"
     resp = requests.get(url)
     if resp.status_code != 200:
-        st.error("Failed to fetch price data.")
         return None
     prices = resp.json().get("prices", [])
+    if not prices:
+        return None
     df = pd.DataFrame(prices, columns=["time", "close"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df = df.set_index("time")
-    df["close"] = df["close"].astype(float)
+    df = df.set_index("time").resample("D").last().ffill().reset_index()
     return df
 
-df = fetch_coingecko_price(coin)
-if df is None or len(df) < lookback + forecast_days + 5:
+# --- 3. FEATURES ---
+
+def make_features(df, lookback=14):
+    df = df.copy()
+    df["returns"] = df["close"].pct_change()
+    df["ma"] = df["close"].rolling(lookback).mean()
+    df["vol"] = df["returns"].rolling(lookback).std()
+    df["momentum"] = df["close"] - df["close"].shift(lookback)
+    df = df.dropna()
+    return df
+
+# --- 4. DASHBOARD CONTROLS ---
+
+st.title("🚀 Crypto Next-Price Predictor (XGBoost)")
+with st.sidebar:
+    coin_name = st.selectbox("Crypto Coin", list(COIN_OPTIONS.keys()), index=0)
+    lookback = st.slider("Lookback Window (days)", min_value=5, max_value=60, value=14, step=1)
+    forecast_days = st.slider("Forecast Horizon (days ahead)", min_value=1, max_value=7, value=1, step=1)
+    days = st.slider("Days of Data to Fetch", min_value=120, max_value=1095, value=365, step=1)
+    show_pred_chart = st.checkbox("Show Prediction Chart", value=True)
+
+# --- 5. LOAD & PROCESS DATA ---
+
+coin_id = COIN_OPTIONS[coin_name]
+df = fetch_coingecko_price(coin_id, days=days)
+
+if df is None or len(df) < (lookback + forecast_days + 10):
     st.warning("Not enough data to model. Choose a different coin or reduce lookback/horizon.")
     st.stop()
 
-def make_features(df, lookback=30):
-    df_feat = pd.DataFrame(index=df.index)
-    df_feat["close"] = df["close"]
-    df_feat["returns"] = np.log(df["close"] / df["close"].shift(1))
-    df_feat["momentum"] = df["close"].pct_change(periods=lookback).fillna(0)
-    df_feat["vol"] = df_feat["returns"].rolling(lookback).std().fillna(0)
-    delta = df["close"].diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(lookback).mean()
-    avg_loss = pd.Series(loss).rolling(lookback).mean()
-    rs = avg_gain / (avg_loss + 1e-6)
-    df_feat["rsi"] = 100 - (100 / (1 + rs))
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df_feat["macd"] = macd
-    df_feat["macd_signal"] = signal
-    df_feat = df_feat.dropna()
-    return df_feat
-
 df_feat = make_features(df, lookback=lookback)
+# Prepare supervised learning (X = features, y = next close)
+df_feat["target"] = df_feat["close"].shift(-forecast_days)
+df_feat = df_feat.dropna().reset_index(drop=True)
 
-def train_predict_xgb(df_feat, forecast_horizon=1):
-    X, y = [], []
-    feat_cols = [c for c in df_feat.columns if c != "close"]
-    data = df_feat.copy().dropna()
-    for i in range(len(data) - forecast_horizon):
-        X.append(data[feat_cols].iloc[i].values)
-        y.append(data["close"].iloc[i + forecast_horizon])
-    X, y = np.array(X), np.array(y)
-    if len(X) < 10:
-        return np.full(len(df_feat), np.nan)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = xgb.XGBRegressor(n_estimators=100, max_depth=4, random_state=42)
-    model.fit(X_scaled, y)
-    X_pred = scaler.transform(data[feat_cols].values)
-    preds = model.predict(X_pred)
-    preds_full = np.full(len(df_feat), np.nan)
-    preds_full[forecast_horizon:len(preds)+forecast_horizon] = preds
-    return preds_full
+if len(df_feat) < 40:
+    st.warning("Not enough samples after feature engineering. Try smaller lookback/horizon or a different coin.")
+    st.stop()
 
-preds_xgb = train_predict_xgb(df_feat, forecast_horizon=forecast_days)
+FEATURES = ["close", "ma", "vol", "momentum"]
 
-chart_df = pd.DataFrame({
-    "Actual": df_feat["close"],
-    f"Pred_XGB_{forecast_days}d": preds_xgb
-}, index=df_feat.index)
+X = df_feat[FEATURES].values
+y = df_feat["target"].values
 
-st.write("## Sample of Prediction Data")
-st.write(chart_df.tail(10))
+# --- 6. TRAIN/VALIDATE MODEL ---
 
-if chart_df.dropna().shape[0] < 3:
-    st.warning("Prediction could not be computed (too little data or all NaN). Try a smaller lookback, a lower forecast horizon, or a different coin.")
-else:
-    st.line_chart(chart_df)
+split_idx = int(len(df_feat)*0.8)
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
 
-# Optional: Download button
-csv = chart_df.to_csv(index=True)
-st.download_button(
-    "Download Data as CSV", csv, "crypto_forecast.csv", "text/csv"
-)
+model = XGBRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+df_feat["pred"] = model.predict(X)
+
+mae = mean_absolute_error(y_test, model.predict(X_test))
+
+# --- 7. SHOW RESULTS ---
+
+st.subheader(f"{coin_name} — MAE: ${mae:,.2f}")
+
+if show_pred_chart:
+    plot_df = df_feat[["time", "close", "pred"]].copy()
+    plot_df = plot_df.set_index("time")
+    # Make the predicted line red, actual blue
+    st.line_chart(plot_df.rename(columns={"close": "Actual Close", "pred": "Predicted Next Close"}))
+
+# --- 8. FUTURE PRICE FORECAST ---
+
+st.markdown("### Forecast Next Price(s)")
+with st.expander("Show forecast for next N days", expanded=True):
+    future_window = df_feat.iloc[-1:][FEATURES].values
+    preds = []
+    last_vals = df_feat.iloc[-1].copy()
+    for step in range(forecast_days):
+        next_pred = model.predict(future_window)[0]
+        preds.append(next_pred)
+        # Roll window forward: simulate the next close
+        last_vals["close"] = next_pred
+        last_vals["ma"] = (last_vals["ma"]*(lookback-1) + next_pred)/lookback
+        last_vals["momentum"] = next_pred - last_vals["close"]
+        # vol is not advanced for simplicity
+        future_window = last_vals[FEATURES].values.reshape(1, -1)
+    st.write(f"**Forecast for next {forecast_days} day(s):**")
+    st.write([f"${p:,.2f}" for p in preds])
+
+st.caption("100% cloud/streamlit. No files or local dependencies.")
+
