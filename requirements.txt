@@ -2,7 +2,6 @@ streamlit
 yfinance
 xgboost
 scikit-learn
-tensorflow
 pandas
 numpy
 plotly
