@@ -1,98 +1,118 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import datetime
 import requests
+import time
+from xgboost import XGBRegressor
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Crypto Predictor", layout="centered")
+st.set_page_config(page_title="Crypto Forecast (XGBoost)", layout="centered")
 
-# --- Robust Feature Fetchers ---
+# ---- Config ----
+TOP_COINS = {
+    "Bitcoin (BTC)": "bitcoin",
+    "Ethereum (ETH)": "ethereum",
+    "Tether (USDT)": "tether",
+    "Solana (SOL)": "solana",
+    "USDC (USDC)": "usd-coin",
+    "BNB (BNB)": "binancecoin",
+    "XRP (XRP)": "ripple",
+    "Dogecoin (DOGE)": "dogecoin",
+    "Toncoin (TON)": "the-open-network",
+    "Cardano (ADA)": "cardano",
+}
+
+# ---- Data Fetch ----
+@st.cache_data(ttl=900, show_spinner=True)
 def fetch_crypto_price_history(coin_id="bitcoin", days=365):
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-        params = {
-            "vs_currency": "usd",
-            "days": days,
-            "interval": "1d"
-        }
-        r = requests.get(url, params=params)
-        if r.status_code != 200:
-            return None
-        prices = r.json().get("prices", [])
-        df = pd.DataFrame(prices, columns=["time", "price"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
-        df = df.set_index("time")
-        df["returns"] = df["price"].pct_change().fillna(0)
-        return df
-    except Exception as e:
-        st.warning(f"Could not fetch price data: {e}")
-        return None
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": days, "interval": "1d"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(5):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            if r.status_code == 200:
+                prices = r.json().get("prices", [])
+                if not prices or len(prices) < 30:
+                    return None
+                df = pd.DataFrame(prices, columns=["time", "price"])
+                df["time"] = pd.to_datetime(df["time"], unit="ms")
+                df = df.set_index("time")
+                df["returns"] = df["price"].pct_change().fillna(0)
+                return df
+            elif r.status_code == 429:
+                time.sleep(3)
+            else:
+                time.sleep(2)
+        except Exception as e:
+            time.sleep(2)
+    return None
 
-def get_trend_score(keyword):
-    try:
-        from pytrends.request import TrendReq
-        pytrends = TrendReq(hl='en-US', tz=360)
-        pytrends.build_payload([keyword], timeframe='now 7-d')
-        trends = pytrends.interest_over_time()
-        if trends.empty:
-            return 0
-        return trends[keyword].iloc[-1]
-    except Exception:
-        return 0
+# ---- Feature Engineering ----
+def make_features(df, lookback=14):
+    df_feat = df.copy()
+    df_feat["ma"] = df_feat["price"].rolling(lookback).mean().fillna(method="bfill")
+    df_feat["vol"] = df_feat["returns"].rolling(lookback).std().fillna(method="bfill")
+    df_feat["momentum"] = df_feat["price"] / df_feat["price"].shift(lookback) - 1
+    df_feat["momentum"] = df_feat["momentum"].fillna(0)
+    df_feat = df_feat.dropna()
+    return df_feat
 
-def get_twitter_sentiment(keyword):
-    try:
-        # Placeholder: No Twitter API
-        return 0
-    except Exception:
-        return 0
+def train_xgb_and_predict(df_feat, forecast_horizon=1):
+    # Prepare dataset
+    X, y = [], []
+    for i in range(len(df_feat) - forecast_horizon):
+        X.append(df_feat.iloc[i][["price", "ma", "vol", "momentum"]].values)
+        y.append(df_feat.iloc[i + forecast_horizon]["price"])
+    if not X or not y:
+        return None, None, None
+    X, y = np.array(X), np.array(y)
+    split = int(0.8 * len(X))
+    model = XGBRegressor(n_estimators=100, random_state=42)
+    model.fit(X[:split], y[:split])
+    y_pred = model.predict(X)
+    return y, y_pred, df_feat.index[forecast_horizon:]
 
-def compute_features(df, coin_name):
-    df = df.copy()
-    lookback = 14
-    df["vol"] = df["returns"].rolling(lookback).std().fillna(0)
-    df["ma"] = df["price"].rolling(lookback).mean().bfill()
-    df["trend_score"] = get_trend_score(coin_name)
-    df["sentiment"] = get_twitter_sentiment(coin_name)
-    return df
+# ---- UI ----
+st.title("🔮 Quantum-Ready Crypto Forecast Dashboard")
+st.markdown("Minimal XGBoost, CoinGecko data, top 10 assets. No local files, all cloud-based.")
 
-# --- Streamlit UI ---
+coin_name = st.selectbox("Choose Crypto Asset", list(TOP_COINS.keys()), index=0)
+coin_id = TOP_COINS[coin_name]
 
-st.title("🚀 Crypto Price Predictor (Robust Chart)")
-coin_id = st.selectbox("Choose a Crypto", [
-    "bitcoin", "ethereum", "solana", "ripple", "cardano", "dogecoin", 
-    "tron", "avalanche-2", "litecoin", "chainlink"
-])
-days = st.slider("Days of historical data", 30, 365, 365)
-show_features = st.checkbox("Show features used in model", value=True)
+col1, col2, col3 = st.columns(3)
+with col1:
+    lookback = st.slider("Lookback Window", min_value=5, max_value=60, value=14, step=1)
+with col2:
+    forecast_horizon = st.slider("Forecast Days Ahead", min_value=1, max_value=7, value=1, step=1)
+with col3:
+    days = st.slider("Days of Data", min_value=60, max_value=730, value=365, step=1)
 
-with st.spinner("Fetching price history..."):
-    df = fetch_crypto_price_history(coin_id, days)
+st.info(f"Pulling last {days} days of {coin_name} prices from CoinGecko...")
 
-if df is None or df.empty:
-    st.error("Failed to fetch data from CoinGecko.")
+df = fetch_crypto_price_history(coin_id=coin_id, days=days)
+if df is None or len(df) < lookback + forecast_horizon + 1:
+    st.error("Failed to fetch data from CoinGecko or not enough data for modeling.")
     st.stop()
 
-with st.spinner("Computing features..."):
-    df_feat = compute_features(df, coin_id)
+st.success(f"Loaded {len(df)} daily prices.")
 
-# Dummy prediction: Shift price by -1 (as placeholder)
-df_feat["predicted"] = df_feat["price"].shift(-1)
-df_feat = df_feat.dropna(subset=["price", "predicted"])
+df_feat = make_features(df, lookback=lookback)
+if len(df_feat) < lookback + forecast_horizon + 1:
+    st.error("Not enough feature rows for this window. Try smaller lookback or more days.")
+    st.stop()
 
-# --- Robust Chart Drawing ---
-if not df_feat.empty and df_feat[["price", "predicted"]].notna().sum().min() > 0:
-    st.subheader(f"Price Prediction for {coin_id.title()}")
-    chart = pd.DataFrame({
-        "Actual": df_feat["price"],
-        "Predicted": df_feat["predicted"]
-    })
-    st.line_chart(chart)
-else:
-    st.warning("Not enough data for chart. Try a different coin, lower days, or wait for data to populate.")
+y_true, y_pred, idx = train_xgb_and_predict(df_feat, forecast_horizon=forecast_horizon)
+if y_true is None or y_pred is None:
+    st.error("Prediction could not be computed. Try other settings.")
+    st.stop()
 
-if show_features:
-    st.subheader("Model Features (Last 10 Rows)")
-    st.dataframe(df_feat.tail(10))
+chart_df = pd.DataFrame({
+    "Actual Price": y_true,
+    "Predicted Next Price": y_pred
+}, index=idx)
 
-st.caption("Sentiment and trend features are used if available. If unavailable, neutral values are used.")
+st.subheader("Actual vs. Predicted (Next Price)")
+st.line_chart(chart_df)
+
+st.caption("MAE (mean absolute error): {:.2f}".format(np.mean(np.abs(y_true - y_pred))))
