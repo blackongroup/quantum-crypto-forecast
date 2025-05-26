@@ -4,4 +4,6 @@ numpy
 xgboost
 scikit-learn
 yfinance
-
+requests
+pytrends
+newspaper3k
