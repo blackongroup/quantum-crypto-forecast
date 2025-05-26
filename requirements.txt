@@ -1,8 +1,12 @@
 streamlit
-xgboost
 pandas
 numpy
-scikit-learn
 requests
-vaderSentiment
+scikit-learn
+xgboost
 pytrends
+vaderSentiment
+yfinance
+newsapi-python
+ta
+tweepy
