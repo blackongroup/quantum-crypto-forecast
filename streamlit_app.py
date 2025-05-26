@@ -7,7 +7,6 @@ from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="Quantum-Ready Crypto Forecaster", layout="wide")
 
-# ----- SETTINGS -----
 DEFAULT_TOP10 = [
     "bitcoin", "ethereum", "solana", "ripple", "dogecoin",
     "cardano", "avalanche-2", "tron", "polkadot", "chainlink"
@@ -25,7 +24,6 @@ COINGECKO_SYMBOLS = {
     "chainlink": "LINK",
 }
 
-# ----- HELPERS -----
 @st.cache_data(show_spinner=False)
 def fetch_price_history(coin_id, days):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
@@ -45,10 +43,13 @@ def fetch_price_history(coin_id, days):
 def make_features(df, lookback=14):
     df_feat = pd.DataFrame(index=df.index)
     df_feat["close"] = df["close"]
-    df_feat["returns"] = df["close"].pct_change().fillna(0)
-    df_feat["logret"] = np.log(df["close"]).diff().fillna(0)
+    # Calculate returns and log returns directly from close
+    returns = df["close"].pct_change().fillna(0)
+    logret = np.log(df["close"]).diff().fillna(0)
+    df_feat["returns"] = returns
+    df_feat["logret"] = logret
     df_feat["sma"] = df["close"].rolling(lookback).mean().fillna(method="bfill")
-    df_feat["vol"] = df["returns"].rolling(lookback).std().fillna(0)
+    df_feat["vol"] = returns.rolling(lookback).std().fillna(0)
     df_feat["momentum"] = df["close"].diff(lookback).fillna(0)
     # RSI
     delta = df["close"].diff().fillna(0)
@@ -83,7 +84,6 @@ def train_predict_xgb(df_feat, forecast_horizon=1):
     preds_full[:-forecast_horizon] = preds[forecast_horizon:]
     return preds_full, y
 
-# ----- UI -----
 st.title("🚀 Quantum-Ready Crypto Prediction Dashboard")
 st.caption("Top 10 most traded cryptos, adjustable lookback, risk, and forecast horizon. Model: XGBoost, QML-ready. Data: CoinGecko.")
 
