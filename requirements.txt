@@ -1,6 +1,8 @@
 streamlit
+xgboost
 pandas
 numpy
 scikit-learn
-xgboost
 requests
+vaderSentiment
+pytrends
