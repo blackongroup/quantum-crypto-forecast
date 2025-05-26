@@ -1,7 +1,8 @@
 streamlit
 numpy
 pandas
-requests
 scikit-learn
 xgboost
+requests
+# use CPU-only TensorFlow for Streamlit Cloud compatibility
 tensorflow-cpu==2.12.0
