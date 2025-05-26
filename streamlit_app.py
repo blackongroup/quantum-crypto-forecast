@@ -96,5 +96,3 @@ if show_features:
     st.dataframe(df_feat.tail(10))
 
 st.caption("Sentiment and trend features are used if available. If unavailable, neutral values are used.")
-
-
