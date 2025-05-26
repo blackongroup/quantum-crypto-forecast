@@ -1,6 +1,7 @@
 streamlit
-pandas
 numpy
-xgboost
-scikit-learn
+pandas
 requests
+scikit-learn
+xgboost
+tensorflow-cpu==2.12.0
