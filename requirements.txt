@@ -1,12 +1,6 @@
 streamlit
 pandas
 numpy
-requests
-scikit-learn
 xgboost
-pytrends
-vaderSentiment
-yfinance
-newsapi-python
-ta
-tweepy
+requests
+
